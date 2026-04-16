@@ -4,16 +4,137 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import hashlib
+import os
 import re
 import time
 import json
 import pika
 import requests
+from datetime import datetime
 
 CLICK_JS = "arguments[0].click();"
 NON_DIGIT_PATTERN = r'[^\d]'
+MAX_INTENTOS_CRAWLER = 3
+BACKOFF_BASE_SEGUNDOS = 5
+SNAPSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'snapshots')
+
+# Selectores CSS/XPath separados del código para facilitar ajustes sin tocar la lógica.
+SELECTORS = {
+    # Login
+    'login_rut_field_id':        'ppriv_per-login-click-input-rut',
+    'login_pass_field_id':       'ppriv_per-login-click-input-password',
+    'login_submit_id':           'ppriv_per-login-click-ingresar-login',
+
+    # Tablas de movimientos
+    'transaction_table':         'table.bch-table',
+    'table_header_cells':        'thead th',
+    'table_body_rows':           'tbody tr.bch-row',
+    'all_transaction_rows':      'tr.bch-row',
+
+    # Paginador (Angular Material)
+    'paginator_roots': [
+        'bch-paginator.mat-paginator',
+        'div.bch-paginator',
+        "[role='group'].bch-paginator",
+    ],
+    'results_per_page_select':   "mat-select[aria-label='Resultados por página']",
+    'paginator_select_fallback': '.mat-paginator-select mat-select',
+    'pagination_option':         "mat-option[role='option']",
+    'paginator_next_btn':        "button.mat-paginator-navigation-next, button[aria-label='Próxima página'], button[aria-label='Proxima página']",
+
+    # Tarjeta de crédito — resumen de facturados
+    'credit_summary_card':       'div.bch-summary.movimientos-facturados',
+    'summary_title':             '.summary-header-title h3',
+    'summary_billed_amount':     '.summary-header-lead .number',
+    'summary_body_rows':         '.summary-body .row.jc-sb',
+    'summary_row_label':         'p.list-item',
+    'summary_row_value':         'span.number',
+}
+
+
+def _guardar_snapshot(scraper, rut, intento):
+    """Guarda el HTML actual del navegador en snapshots/ para post-mortem debugging."""
+    if scraper is None or not hasattr(scraper, 'driver'):
+        return
+    try:
+        os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        rut_safe = re.sub(r'[^0-9]', '', str(rut))[:8]
+        filename = f"{ts}_rut{rut_safe}_intento{intento}.html"
+        filepath = os.path.join(SNAPSHOTS_DIR, filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(scraper.driver.page_source)
+        print(f" [~] Snapshot guardado: {filename}")
+    except Exception as snap_err:
+        print(f" [~] No se pudo guardar snapshot: {snap_err}")
+
 
 class BancoChileCrawler:
+    def _extract_facturados_table_movements(self, table, scope_key):
+        """
+        Extrae los movimientos de la tabla de facturados, considerando correctamente el monto y cuotas.
+        Para nacional: usa 'Monto operación (CLP)' y 'Cuotas'.
+        Para internacional: usa 'Cargo (USD)' y 'Cuotas' si existe.
+        """
+        headers = table.find_elements(By.CSS_SELECTOR, SELECTORS['table_header_cells'])
+        header_map = {}
+        for idx, th in enumerate(headers):
+            text = (th.text or '').strip().lower()
+            if 'monto operación' in text or 'monto operacion' in text:
+                header_map['monto'] = idx
+            elif 'cargo (usd)' in text:
+                header_map['monto'] = idx
+            elif 'cuotas' in text:
+                header_map['cuotas'] = idx
+            elif 'descripción' in text or 'descripcion' in text:
+                header_map['descripcion'] = idx
+            elif 'fecha' in text:
+                header_map['fecha'] = idx
+            elif 'tipo movimiento' in text:
+                header_map['tipo'] = idx
+        movimientos = []
+        rows = table.find_elements(By.CSS_SELECTOR, SELECTORS['table_body_rows'])
+        for row in rows:
+            celdas = row.find_elements(By.CSS_SELECTOR, 'td')
+            if not celdas or len(celdas) < 5:
+                continue
+            # Extraer monto
+            monto = None
+            if 'monto' in header_map:
+                monto_text = celdas[header_map['monto']].text
+                monto = self._parse_amount(monto_text)
+            # Extraer cuotas
+            cuotas = None
+            if 'cuotas' in header_map:
+                cuotas_text = celdas[header_map['cuotas']].text.strip()
+                cuotas = cuotas_text if cuotas_text else None
+            # Extraer otros campos
+            descripcion = celdas[header_map['descripcion']].text.strip() if 'descripcion' in header_map else ''
+            fecha = celdas[header_map['fecha']].text.strip() if 'fecha' in header_map else ''
+            tipo = celdas[header_map['tipo']].text.strip() if 'tipo' in header_map else ''
+            movimientos.append({
+                'fecha': fecha,
+                'tipo': tipo,
+                'descripcion': descripcion,
+                'monto': monto,
+                'cuotas': cuotas,
+            })
+        return movimientos
+
+    def extract_facturados_movimientos(self, scope_key='nacional'):
+        """
+        Busca la tabla de movimientos facturados y extrae los movimientos con monto y cuotas.
+        scope_key: 'nacional' o 'internacional'
+        """
+        tables = self.driver.find_elements(By.CSS_SELECTOR, SELECTORS['transaction_table'])
+        for table in tables:
+            headers = table.find_elements(By.CSS_SELECTOR, SELECTORS['table_header_cells'])
+            for th in headers:
+                text = (th.text or '').strip().lower()
+                if (scope_key == 'nacional' and ('monto operación' in text or 'monto operacion' in text)) or \
+                    (scope_key == 'internacional' and 'cargo (usd)' in text):
+                    return self._extract_facturados_table_movements(table, scope_key)
+        return []
     # ... (Mantén tu clase BancoChileCrawler EXACTAMENTE igual aquí) ...
     def __init__(self, rut, password):
         self.rut = rut
@@ -51,13 +172,13 @@ class BancoChileCrawler:
             if paginator is not None:
                 dropdowns = paginator.find_elements(
                     By.CSS_SELECTOR,
-                    "mat-select[aria-label='Resultados por página'], .mat-paginator-select mat-select",
+                    f"{SELECTORS['results_per_page_select']}, {SELECTORS['paginator_select_fallback']}",
                 )
 
             if not dropdowns:
                 dropdowns = self.driver.find_elements(
                     By.CSS_SELECTOR,
-                    "mat-select[aria-label='Resultados por página']",
+                    SELECTORS['results_per_page_select'],
                 )
 
             for dropdown in dropdowns:
@@ -71,7 +192,7 @@ class BancoChileCrawler:
             self.driver.execute_script(CLICK_JS, dropdown_paginas)
             self.wait.until(
                 EC.presence_of_all_elements_located(
-                    (By.CSS_SELECTOR, "mat-option[role='option']")
+                    (By.CSS_SELECTOR, SELECTORS['pagination_option'])
                 )
             )
 
@@ -79,7 +200,7 @@ class BancoChileCrawler:
                 opcion
                 for opcion in self.driver.find_elements(
                     By.CSS_SELECTOR,
-                    "mat-option[role='option']",
+                    SELECTORS['pagination_option'],
                 )
                 if opcion.is_displayed()
             ]
@@ -97,11 +218,7 @@ class BancoChileCrawler:
             return None
 
     def _find_visible_paginator(self):
-        paginator_selectors = [
-            "bch-paginator.mat-paginator",
-            "div.bch-paginator",
-            "[role='group'].bch-paginator",
-        ]
+        paginator_selectors = SELECTORS['paginator_roots']
 
         for selector in paginator_selectors:
             paginators = self.driver.find_elements(By.CSS_SELECTOR, selector)
@@ -174,7 +291,7 @@ class BancoChileCrawler:
 
         try:
             table = sample_row.find_element(By.XPATH, "ancestor::table[1]")
-            headers = table.find_elements(By.CSS_SELECTOR, 'thead th')
+            headers = table.find_elements(By.CSS_SELECTOR, SELECTORS['table_header_cells'])
 
             for header in headers:
                 header_classes = header.get_attribute('class') or ''
@@ -222,7 +339,7 @@ class BancoChileCrawler:
         target_scope = self._normalize_text(scope_label)
         cards = self.driver.find_elements(
             By.CSS_SELECTOR,
-            "div.bch-summary.movimientos-facturados",
+            SELECTORS['credit_summary_card'],
         )
 
         for card in cards:
@@ -232,14 +349,14 @@ class BancoChileCrawler:
 
                 title = card.find_element(
                     By.CSS_SELECTOR,
-                    ".summary-header-title h3",
+                    SELECTORS['summary_title'],
                 ).text.strip()
                 if target_scope not in self._normalize_text(title):
                     continue
 
                 billed_text = card.find_element(
                     By.CSS_SELECTOR,
-                    ".summary-header-lead .number",
+                    SELECTORS['summary_billed_amount'],
                 ).text.strip()
                 billed_amount, billed_currency = self._parse_amount_with_currency(
                     billed_text,
@@ -250,11 +367,11 @@ class BancoChileCrawler:
 
                 rows = card.find_elements(
                     By.CSS_SELECTOR,
-                    ".summary-body .row.jc-sb",
+                    SELECTORS['summary_body_rows'],
                 )
                 for row in rows:
-                    label = row.find_element(By.CSS_SELECTOR, 'p.list-item').text.strip()
-                    value = row.find_element(By.CSS_SELECTOR, 'span.number').text.strip()
+                    label = row.find_element(By.CSS_SELECTOR, SELECTORS['summary_row_label']).text.strip()
+                    value = row.find_element(By.CSS_SELECTOR, SELECTORS['summary_row_value']).text.strip()
                     normalized_label = self._normalize_text(label)
 
                     if 'fecha de facturacion' in normalized_label:
@@ -331,7 +448,7 @@ class BancoChileCrawler:
             if paginator is not None:
                 botones = paginator.find_elements(
                     By.CSS_SELECTOR,
-                    "button.mat-paginator-navigation-next, button[aria-label='Próxima página'], button[aria-label='Proxima página']",
+                    SELECTORS['paginator_next_btn'],
                 )
 
                 for boton in botones:
@@ -462,14 +579,14 @@ class BancoChileCrawler:
 
         # 3. Llenar el formulario
         input_rut = self.wait.until(
-            EC.presence_of_element_located((By.ID, 'ppriv_per-login-click-input-rut'))
+            EC.presence_of_element_located((By.ID, SELECTORS['login_rut_field_id']))
         )
         input_rut.send_keys(self.rut)
 
-        input_pass = self.driver.find_element(By.ID, 'ppriv_per-login-click-input-password')
+        input_pass = self.driver.find_element(By.ID, SELECTORS['login_pass_field_id'])
         input_pass.send_keys(self.password)
 
-        btn_submit = self.driver.find_element(By.ID, 'ppriv_per-login-click-ingresar-login')
+        btn_submit = self.driver.find_element(By.ID, SELECTORS['login_submit_id'])
         btn_submit.click()
         
         # 4. Esperar a que el dashboard principal cargue (validación de login exitoso)
@@ -482,7 +599,7 @@ class BancoChileCrawler:
     def extract_transactions(self):
         # 1. Esperamos a que la tabla cargue en el DOM
         self.wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'table.bch-table'))
+            EC.presence_of_element_located((By.CSS_SELECTOR, SELECTORS['transaction_table']))
         )
         
         # --- NUEVO: CAMBIAR RESULTADOS A 100 ---
@@ -890,7 +1007,7 @@ class BancoChileCrawler:
 
         movimientos = []
         numero_pagina = 1
-        max_paginas = 50
+        max_paginas = 5
 
         while numero_pagina <= max_paginas:
             print(f"Extrayendo TC {statement_key}/{scope_key} - página {numero_pagina}...")
@@ -936,7 +1053,7 @@ class BancoChileCrawler:
 
     def _collect_credit_rows_from_current_page(self, statement_key, scope_key, facturado_summary, billing_date_hint):
         extracted_rows = []
-        rows = self.driver.find_elements(By.CSS_SELECTOR, 'tr.bch-row')
+        rows = self.driver.find_elements(By.CSS_SELECTOR, SELECTORS['all_transaction_rows'])
         currency_context = self._resolve_currency_context_for_rows(rows, scope_key)
 
         for row in rows:
@@ -1039,17 +1156,24 @@ class BancoChileCrawler:
 # Endpoint de backend
 ENDPOINT_DESTINO = 'http://localhost:3000/api/banco-chile/save-data'
 
-def enviar_payload_backend(payload, etiqueta, cantidad):
-    print(f" [>] Enviando {cantidad} movimientos de {etiqueta} al backend...")
-    respuesta = requests.post(ENDPOINT_DESTINO, json=payload)
+def enviar_payload_backend(payload, etiqueta, cantidad, max_reintentos=3):
+    for intento in range(1, max_reintentos + 1):
+        try:
+            print(f" [>] Enviando {cantidad} movimientos de {etiqueta} al backend (intento {intento}/{max_reintentos})...")
+            respuesta = requests.post(ENDPOINT_DESTINO, json=payload, timeout=30)
+            if respuesta.status_code in [200, 201]:
+                print(f" [v] Movimientos de {etiqueta} enviados correctamente.")
+                return
+            print(f" [!] Error HTTP al enviar {etiqueta}: {respuesta.status_code} - {respuesta.text}")
+        except requests.RequestException as e:
+            print(f" [!] Error de red al enviar {etiqueta} (intento {intento}): {e}")
 
-    if respuesta.status_code in [200, 201]:
-        print(f" [v] Movimientos de {etiqueta} enviados correctamente.")
-    else:
-        print(
-            f" [!] Error al enviar datos de {etiqueta}: "
-            f"{respuesta.status_code} - {respuesta.text}"
-        )
+        if intento < max_reintentos:
+            espera = BACKOFF_BASE_SEGUNDOS * (2 ** (intento - 1))
+            print(f" [~] Reintentando envío de {etiqueta} en {espera}s...")
+            time.sleep(espera)
+
+    print(f" [X] No se pudo enviar {etiqueta} después de {max_reintentos} intentos.")
 
 def cerrar_sesion_y_navegador(scraper):
     try:
@@ -1060,92 +1184,110 @@ def cerrar_sesion_y_navegador(scraper):
     finally:
         scraper.close()
 
+def _ejecutar_intento_scraping(rut, password, intento):
+    """Ejecuta login + extracción + cierre de sesión. Guarda snapshot y relanza si falla."""
+    scraper = BancoChileCrawler(rut, password)
+    try:
+        scraper.login()
+        movimientos = scraper.extract_transactions()
+        print(" [>] Extrayendo movimientos de tarjeta de crédito...")
+        movimientos_tc = scraper.extract_credit_card_transactions()
+        cerrar_sesion_y_navegador(scraper)
+    except Exception:
+        _guardar_snapshot(scraper, rut, intento)
+        cerrar_sesion_y_navegador(scraper)
+        raise
+
+    payload_cc = {"rut": rut, "movimientos": movimientos, "sourceType": "BANCO_CHILE_CC"}
+    payload_tc = None
+    if movimientos_tc:
+        payload_tc = {
+            "rut": rut,
+            "movimientos": movimientos_tc,
+            "interface": "credit_card_v1",
+            "sourceType": "BANCO_CHILE_TC",
+        }
+    else:
+        print(" [!] No se encontraron movimientos de tarjeta para enviar.")
+
+    return payload_cc, payload_tc
+
+
 def procesar_mensaje(ch, method, properties, body):
     print(" [x] Mensaje recibido de la cola.")
-    scraper = None
-    
+
     try:
-        # 1. Decodificar el mensaje JSON
-        mensaje_str = body.decode('utf-8')
-        mensaje_json = json.loads(mensaje_str)
-        
-        # 2. Verificar que el patrón coincida con lo que manda NestJS
-        if mensaje_json.get('pattern') == 'procesar_transaccion':
-            data = mensaje_json.get('data', {})
-            rut = data.get('rut')
-            password = data.get('password')
-            
-            print(f" [>] Iniciando crawler para RUT: {rut}")
-            
-            # 3. Iniciar el crawler con las credenciales extraídas
-            scraper = BancoChileCrawler(rut, password)
-            
-            scraper.login()
-            movimientos = scraper.extract_transactions()
-            print(" [>] Iniciando extracción de movimientos de tarjeta de crédito...")
-            movimientos_tc = scraper.extract_credit_card_transactions()
-            
-            # 4. Preparar payloads y cerrar sesión antes de enviar datos al backend
-            payload = {
-                "rut": rut,
-                "movimientos": movimientos,
-                "sourceType": "BANCO_CHILE_CC"
-            }
+        mensaje_json = json.loads(body.decode('utf-8'))
+        if mensaje_json.get('pattern') != 'procesar_transaccion':
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+        data = mensaje_json.get('data', {})
+        rut = data.get('rut', 'desconocido')
+        password = data.get('password')
+    except Exception as e:
+        print(f" [X] Mensaje malformado: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
 
-            payload_tc = None
-
-            if movimientos_tc:
-                payload_tc = {
-                    "rut": rut,
-                    "movimientos": movimientos_tc,
-                    "interface": "credit_card_v1",
-                    "sourceType": "BANCO_CHILE_TC"
-                }
-            else:
-                print(" [!] No se encontraron movimientos de tarjeta para enviar.")
-
-            # Cierra el navegador antes de enviar la información.
-            cerrar_sesion_y_navegador(scraper)
-            scraper = None
-
-            enviar_payload_backend(payload, 'cuenta', len(movimientos))
-
+    for intento in range(1, MAX_INTENTOS_CRAWLER + 1):
+        try:
+            print(f" [>] Crawler para RUT {rut} — intento {intento}/{MAX_INTENTOS_CRAWLER}")
+            payload_cc, payload_tc = _ejecutar_intento_scraping(rut, password, intento)
+            enviar_payload_backend(payload_cc, 'cuenta', len(payload_cc['movimientos']))
             if payload_tc is not None:
-                enviar_payload_backend(payload_tc, 'tarjeta', len(movimientos_tc))
-            
-            # 5. Confirmar a RabbitMQ que el mensaje fue procesado exitosamente (Acknowledgment)
+                enviar_payload_backend(payload_tc, 'tarjeta', len(payload_tc['movimientos']))
             ch.basic_ack(delivery_tag=method.delivery_tag)
             print(" [x] Proceso finalizado y mensaje removido de la cola.\n")
-            
-    except Exception as e:
-        print(f" [X] Error durante el procesamiento: {e}")
-        # En caso de error crítico, rechazamos el mensaje para que vuelva a la cola o se descarte
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        if scraper is not None:
-            try:
-                scraper.close()
-            except Exception:
-                pass
+            return
+        except Exception as e:
+            print(f" [X] Error en intento {intento}/{MAX_INTENTOS_CRAWLER}: {e}")
+            if intento < MAX_INTENTOS_CRAWLER:
+                espera = BACKOFF_BASE_SEGUNDOS * (3 ** (intento - 1))
+                print(f" [~] Reintentando en {espera}s...")
+                time.sleep(espera)
+
+    print(f" [X] Todos los intentos fallaron para RUT {rut}. Enviando a DLQ.")
+    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+    
+def _declarar_cola_principal(conexion, canal, queue, dlx_name, dlq_name):
+    """Declara la cola principal con soporte DLQ.
+    Si ya existe con args distintos (error 406), la elimina y la recrea.
+    Devuelve el canal activo (puede ser uno nuevo si el broker cerró el original).
+    """
+    args = {
+        'x-dead-letter-exchange': dlx_name,
+        'x-dead-letter-routing-key': dlq_name,
+    }
+    try:
+        canal.queue_declare(queue=queue, durable=True, arguments=args)
+    except pika.exceptions.ChannelClosedByBroker as e:
+        if e.args[0] != 406:
+            raise
+        print(f" [!] Cola '{queue}' existe con argumentos distintos. Recreando con soporte DLQ...")
+        canal = conexion.channel()
+        canal.queue_delete(queue=queue)
+        canal.queue_declare(queue=queue, durable=True, arguments=args)
+        print(f" [v] Cola '{queue}' recreada con soporte DLQ.")
+    return canal
 
 def iniciar_consumidor():
-    # Conexión al servidor RabbitMQ (ajusta 'localhost' si usas otra IP)
     conexion = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     canal = conexion.channel()
 
-    # Declarar la cola (durable=True coincide con la configuración que pusiste en NestJS)
-    canal.queue_declare(queue='cola-banco-chile', durable=True)
+    DLX_NAME = 'dlx.banco-chile'
+    DLQ_NAME = 'cola-banco-chile.dead'
+    MAIN_QUEUE = 'cola-banco-chile'
 
-    # basic_qos(prefetch_count=1) asegura que el worker tome de a 1 mensaje a la vez,
-    # ideal para procesos pesados como Selenium
+    # Dead-letter exchange y cola de mensajes fallidos
+    canal.exchange_declare(exchange=DLX_NAME, exchange_type='direct', durable=True)
+    canal.queue_declare(queue=DLQ_NAME, durable=True)
+    canal.queue_bind(queue=DLQ_NAME, exchange=DLX_NAME, routing_key=DLQ_NAME)
+
+    canal = _declarar_cola_principal(conexion, canal, MAIN_QUEUE, DLX_NAME, DLQ_NAME)
     canal.basic_qos(prefetch_count=1)
+    canal.basic_consume(queue=MAIN_QUEUE, on_message_callback=procesar_mensaje)
 
-    # Configurar qué función se ejecutará cuando llegue un mensaje
-    canal.basic_consume(
-        queue='cola-banco-chile', 
-        on_message_callback=procesar_mensaje
-    )
-
-    print(' [*] Esperando mensajes en "cola-banco-chile". Para salir presiona CTRL+C')
+    print(f' [*] Esperando mensajes en "{MAIN_QUEUE}". Para salir presiona CTRL+C')
     canal.start_consuming()
 
 if __name__ == "__main__":
